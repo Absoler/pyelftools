@@ -8,11 +8,16 @@
 # This code is in the public domain
 #-------------------------------------------------------------------------------
 import argparse
+from curses.ascii import isgraph
+from dis import Instruction
 import os, sys
+from symbol import factor
 import string
 import traceback
 import itertools
 import re
+import json
+import ctypes
 # Note: zip has different behaviour between Python 2.x and 3.x.
 # - Using izip ensures compatibility.
 try:
@@ -24,6 +29,8 @@ except:
 # installed pyelftools.
 sys.path.insert(0, '.')
 
+from iced_x86 import Instruction
+from iced_x86 import Register
 from iced_x86 import *  # for disassembly
 import bisect           # 
 from elftools import __version__
@@ -1680,13 +1687,22 @@ class ReadElf(object):
         self.output.write(str(s).rstrip() + '\n')
 
 
-    
+    def check_addr(self, ins: Instruction) -> bool:
+        '''
+         check whether the address in this instr can be processed now, 
+         it must be [ rbp/rsp + displacement ]
+        '''
+        if ( (ins.memory_base == Register.RSP or ins.memory_base ==Register.RBP) and ins.memory_index == Register.NONE
+            or (ins.memory_index == Register.RSP or ins.memory_index == Register.RBP) and ins.memory_base == Register.NONE ):
+            return True
+        return False
 
     def check_var(self, die: DIE, offset) -> bool:
         '''check whether it's a variable die we can deal with now
         '''
-        if ( "DW_AT_location" in die.attributes and
-            "DW_OP_fbreg" in describe_attr_value_extra(die.attributes["DW_AT_location"], die, offset)):
+        if ( "DW_AT_location" in die.attributes
+            and "DW_OP_fbreg" in describe_attr_value_extra(die.attributes["DW_AT_location"], die, offset)
+            and "DW_AT_name" in die.attributes):
             return True
         else:
             return False
@@ -1694,9 +1710,14 @@ class ReadElf(object):
     def check_func(self, func: DIE) -> bool:
         '''check whether it's a function die we can process now
         '''
-        if ( "DW_AT_frame_base" in func.attributes):
-            return True
-        return False
+        if (not "DW_AT_frame_base" in func.attributes):
+            return False
+        if ("DW_AT_name" not in func.attributes and 
+            "DW_AT_low_pc" not in func.attributes and
+            "DW_AT_entry_pc" not in func.attributes):
+            # used to identify a function
+            return False
+        return True
 
 
     class FuncManager:
@@ -1705,6 +1726,7 @@ class ReadElf(object):
         def __init__(self, _debugInfo_offset):
             self.low_pc = 0
             self.name = ""
+            self.range = 0
 
             self.debugInfo_offset = _debugInfo_offset
 
@@ -1725,7 +1747,8 @@ class ReadElf(object):
             cfa_reg = describe_reg_name(cfa.reg)
             cfa_offset = cfa.offset
 
-            if(reg!=cfa_reg):
+            if(reg!=cfa_reg): 
+                # this may be fixed by caculating the distance between rsp and rbp
                 print("reg used by inst doesn't match last cfa")
                 return
             
@@ -1735,6 +1758,19 @@ class ReadElf(object):
                 return
             name = self.var_entries[var_index].attributes["DW_AT_name"]
             return "\t"+describe_attr_value(name, self.var_entries[var_index], self.debugInfo_offset).strip() + f' + ({offset-self.vars_list[var_index]})'
+
+    class MemInfo:
+        def __init__(self, base, index, disp, access) -> None:
+            self.base = base
+            self.index = index
+            self.displacement = disp
+            self.access = access
+
+        def __eq__(self, mem) -> bool:
+            return self.base == mem.base and \
+            self.index == mem.index and \
+            self.displacement == mem.displacement and \
+            self.access == mem.access
 
     def sort_entries_withId(self, entries: list,  findId):
         entries.sort(key=findId)
@@ -1769,38 +1805,65 @@ class ReadElf(object):
         if not self._dwarfinfo.has_debug_info:
             return
         
+        showVars = True
+        showFrames = False
+
         debugInfo_offset = self._dwarfinfo.debug_info_sec.global_offset
-        print(f'offset& {debugInfo_offset}')
+        # print(f'offset& {debugInfo_offset}')
         var_entries = []
         var_funcMap = {}
         func_mgrMap = {}
 
         # find funcs' low pc
-        func_pcMap = {}
+        funcName_pcMap = {}
+        pc_funcNameMap = {}
+        funcName_rangeMap = {}
         symsec = self.elffile.get_section_by_name(".symtab")
         if not symsec:
             print("no .symtab in elf")
             return
         for sym in symsec.iter_symbols():
             if "STT_FUNC" == sym['st_info']['type']:
-                print(f'sym {sym.name} {sym["st_value"]}')
-                func_pcMap[sym.name] = sym["st_value"]
+                print(f'func in sym {sym.name} {sym["st_value"]}')
+                funcName_pcMap[sym.name] = sym["st_value"]
+                pc_funcNameMap[ sym["st_value"] ] = sym.name
+                funcName_rangeMap[sym.name] = sym["st_size"]
 
+        '''
+        we only care functions that have dwarf info
+        1. gather functions from dwarf into FuncManager
+        2. gather variable under corresponding function node
+        '''
         for cu in self._dwarfinfo.iter_CUs():
             current_function = None
             current_mgr = None
             for die in cu.iter_DIEs():
-                if die.tag == "DW_TAG_subprogram" and self.check_func(die):
+                if die.tag == "DW_TAG_subprogram":
+                    if not self.check_func(die):
+                        current_function = None
+                        current_mgr = None
+                        continue
+
                     current_function = die
                     current_mgr = self.FuncManager(debugInfo_offset)
                     current_mgr.func = die
-                    current_mgr.name = describe_attr_value(die.attributes["DW_AT_name"], die, debugInfo_offset).strip()
-                    if ":" in current_mgr.name:
-                        _ = current_mgr.name.rfind(":")
-                        current_mgr.name = current_mgr.name[_+1:].strip()
-                        print(current_mgr.name)
-                    current_mgr.low_pc = func_pcMap[current_mgr.name]
 
+                    # identify function by name or pc
+                    if "DW_AT_low_pc" in die.attributes:
+                        current_mgr.low_pc = die.attributes['DW_AT_low_pc'].value
+                        current_mgr.name = pc_funcNameMap[current_mgr.low_pc]
+                    elif "DW_AT_entry_pc" in die.attributes:
+                        current_mgr.low_pc = die.attributes['DW_AT_entry_pc'].value
+                        current_mgr.name = pc_funcNameMap[current_mgr.low_pc]
+                    elif "DW_AT_name" in die.attributes:
+                        current_mgr.name = describe_attr_value(die.attributes["DW_AT_name"], die, debugInfo_offset).strip()
+                        if ":" in current_mgr.name:
+                            _ = current_mgr.name.rfind(":")
+                            current_mgr.name = current_mgr.name[_+1:].strip()
+                            print(current_mgr.name)
+                        current_mgr.low_pc = funcName_pcMap[current_mgr.name]
+
+                    current_mgr.range = funcName_rangeMap[current_mgr.name]
                     self.FuncManager.func_entries.append(current_mgr)
 
                     func_mgrMap[die] = current_mgr
@@ -1829,28 +1892,35 @@ class ReadElf(object):
             frame_entries = self._dwarfinfo.CFI_entries()
         frame_entries = list(filter(lambda entry: isinstance(entry, FDE), frame_entries))
 
-        for var in var_entries:
-            desc = describe_attr_value_extra(var.attributes['DW_AT_location'], var, debugInfo_offset)
-            name = describe_attr_value(var.attributes['DW_AT_name'], var, debugInfo_offset)
-            if(var in var_funcMap):
-                func = var_funcMap[var]
-                funcName = func_mgrMap[func].name
-                print(f'{name.strip()}: {desc} belong to: {funcName}')
+        if showVars:
+            for var in var_entries:
+                desc = describe_attr_value_extra(var.attributes['DW_AT_location'], var, debugInfo_offset)
+                name = describe_attr_value(var.attributes['DW_AT_name'], var, debugInfo_offset)
+                if(var in var_funcMap):
+                    func = var_funcMap[var]
+                    funcName = func_mgrMap[func].name
+                    print(f'{name.strip()}: {desc} belong to: {funcName}')
+
         # 接下来该初始化mgr中的frame信息
         print("frames: ")
         for frame in frame_entries:
             func_index = bisect.bisect_right(self.FuncManager.func_list, frame["initial_location"]) - 1
-            if(func_index<0):
-                print("frame cant find func")
+            if(func_index < 0 or self.FuncManager.func_list[func_index] != frame["initial_location"]):
+                print(f"no func start {frame['initial_location']:X} but a frame start here")
                 continue
-            
-            print(f'pc  {frame["initial_location"]} -- {frame["address_range"]}')
+            if showFrames:
+                print(f'pc  {frame["initial_location"]} -- {frame["address_range"]}')
             table = frame.get_decoded()
             for line in table.table:
-                print(f'pc {line["pc"]} cfa {line["cfa"]}')
+                if showFrames:
+                    print(f'pc {line["pc"]} cfa {line["cfa"]}')
+                # ensure the order is equal
                 self.FuncManager.func_entries[func_index].cfas.append(line["cfa"])
                 self.FuncManager.func_entries[func_index].cfa_pcs.append(line["pc"])
 
+        '''
+        start disassembling ...
+        '''
         code = self.elffile.get_section_by_name('.text')
         addr = code['sh_addr']
         print(f'code addr: {addr}')
@@ -1863,57 +1933,244 @@ class ReadElf(object):
         func_index = -1
         for instr in decoder:
             disasm = formatter.format(instr)
-            end_pat = ["h]", "]"]  # offset tail of current format
-            start_index = instr.ip - addr
-            bytes_str = code[start_index:start_index + instr.len].hex().upper()
+            # end_pat = ["h]", "]"]  # offset tail of current format
+            # start_index = instr.ip - addr
+            # bytes_str = code[start_index:start_index + instr.len].hex().upper()
 
-            if(func_index < len(self.FuncManager.func_list)-1 and
-                instr.ip > self.FuncManager.func_list[func_index + 1]
-                or func_index == -1):
+
+            '''
+            1. decide which function (has dwarf info) is corresponded with the current instruction
+            2. if no such function, do nothing
+            '''
+            if func_index < len(self.FuncManager.func_list)-1 and \
+                instr.ip >= self.FuncManager.func_list[func_index + 1] and \
+                instr.ip < self.FuncManager.func_list[func_index+1] + self.FuncManager.func_entries[func_index+1].range:
                 func_index += 1
                 current_mgr = self.FuncManager.func_entries[func_index]
-                print(f'\n{current_mgr.name}:')
+                print(f'\n{instr.ip:0X} {current_mgr.name}:')
+
+            if func_index == -1:
+                continue
+            if not (instr.ip >= self.FuncManager.func_list[func_index] and \
+                instr.ip < self.FuncManager.func_list[func_index] + self.FuncManager.func_entries[func_index].range):
+                continue
+
+           
+            if not self.check_addr(instr):
+                continue
             
-            
-            # if(self.FuncManager.func_list[func_index] == instr.ip):
-            #     print(f'\n{describe_attr_value(current_mgr.func.attributes["DW_AT_name"], current_mgr.func, debugInfo_offset)}:')
-            
-            # now we only consider the simplest case, [rsp(+|-)const[h]]"
-            # print(f"{instr.ip:016X} {bytes_str:20} {disasm}")
+            assert(instr.memory_index_scale == 1)
+            assert(instr.memory_index == Register.NONE)
+
+            # now we only consider the simplest case, [ rbp/rsp + displacement ]"
             dump_instr = f"{instr.ip:016X} {disasm}"
+            
+
             if (instr.memory_base == Register.RSP):
-                s = disasm.find("rsp")
-                num="0"
-                if(disasm[s+3]!=']'):
-                    t = len(disasm)
-                    for pat in end_pat:
-                        tmp = disasm.find(pat, s)
-                        if(tmp!=-1):
-                            t = min(t, tmp)
-                    num = int(disasm[s+3:t], 16)
+                # num="0"
+                # if(disasm[s+3]!=']'):
+                #     t = len(disasm)
+                #     for pat in end_pat:
+                #         tmp = disasm.find(pat, s)
+                #         if(tmp!=-1):
+                #             t = min(t, tmp)
+                #     num = int(disasm[s+3:t], 16)
                 # print(f'\trsp+{num}')
-                local = current_mgr.getVar(instr.ip, 'rsp', num)
+                local = current_mgr.getVar(instr.ip, 'rsp', instr.memory_displacement)
                 if(local):
                     dump_instr += local
                 # print(f'{current_mgr.getVar(instr.ip, "rsp", num)}')
             
             elif (instr.memory_base == Register.RBP):
-                s = disasm.find("rbp")
-                num="0"
-                if(disasm[s+3]!=']'):
-                    t = len(disasm)
-                    for pat in end_pat:
-                        tmp = disasm.find(pat, s)
-                        if(tmp!=-1):
-                            t = min(t, tmp)
-                    num = int(disasm[s+3:t], 16)
-                # print(f'\trbp+{num}')
-                local = current_mgr.getVar(instr.ip, 'rbp', num)
+
+                local = current_mgr.getVar(instr.ip, 'rbp', instr.memory_displacement)
                 if(local):
                     dump_instr += local
-                # print(f'{current_mgr.getVar(instr.ip, "rbp", num)}')
             
             print(dump_instr)
+
+    def hasMem(self, instr) -> bool:
+        for i in range(instr.op_count):
+            if(instr.op_kind(i) == OpKind.MEMORY):
+                return True
+        return False
+    
+    def sameMem(self, i:Instruction, j:Instruction):
+        return i.memory_base == j.memory_base and \
+                i.memory_index == j.memory_index and \
+                i.memory_index_scale == j.memory_index_scale and \
+                i.memory_displacement == j.memory_displacement
+    
+    def getRealLine(self, line:int, lines:list, err:int) -> int:
+        mx = max(lines)
+        if line in lines and mx!=line:
+            return line
+        for i in range(1, err):
+            if(line-i in lines and mx!=line):
+                return line 
+        
+
+    def create_enum_dict(self, module):
+        ''' for descript iced_x86 int attributes
+        '''
+        return {module.__dict__[key]:key for key in module.__dict__ if isinstance(module.__dict__[key], int)}
+
+    def is_read(self, mem:UsedMemory, mp:dict) -> bool:
+        return mp[mem.access] == "READ"
+
+    def check_loads(self, checkGuide):
+        '''
+        check whether there's compiler-introduced double fetch
+        ### conditions:
+        1. duplicate address used in instructions from the same line
+        '''
+
+        # some control options
+        showDisas = False
+        isGroup = False
+        '''
+        process guide file from coccinelle's match result
+        [ file:str, [ lineNo:int | [lineNo:int] ] ]
+        '''
+        with open(checkGuide, "r+") as js:
+            inputLine = json.loads(js.readline())
+            assert(len(inputLine)==2)
+            lineGroups = inputLine[1]
+            if len(lineGroups):
+                isGroup = " " in lineGroups[0]
+            else:
+                exit(0)
+
+
+        line_pcsMap = {}     # int -> set(int)
+        pc_lineMap = {}      # for gathering homeless instructions
+        pc_instMap = {}
+        line_instMap = {}    # int -> list[Instruction]
+        problems = {}        # int -> set(Instruction)
+
+        self._init_dwarfinfo()
+        if self._dwarfinfo is None:
+            return
+
+        set_global_machine_arch(self.elffile.get_machine_arch())
+        if not self._dwarfinfo.has_debug_info:
+            return
+        
+
+        for cu in self._dwarfinfo.iter_CUs():
+            lineprogram = self._dwarfinfo.line_program_for_CU(cu)
+            for entry in lineprogram.get_entries():
+                if entry.state is None:
+                    continue
+                state = entry.state # state is defined by DWARF4 6.2.2
+                if not state.end_sequence: 
+                    if state.line not in line_pcsMap:
+                        line_pcsMap[state.line] = set()
+                    line_pcsMap[state.line].add(state.address)
+                    pc_lineMap[state.address] = state.line
+
+
+        code = self.elffile.get_section_by_name('.text')
+        addr = code['sh_addr']
+        # print(f'code addr: {addr}')
+        code = code.data()
+        decoder = Decoder(64, code, ip=addr)
+        formatter = Formatter(FormatterSyntax.INTEL)
+        
+        reg_to_str = self.create_enum_dict(Register)
+        op_access_to_str = self.create_enum_dict(OpAccess)
+
+        cur_line = -1
+        for instr in decoder:
+            pc_instMap[instr.ip] = instr
+            if instr.ip in pc_lineMap:
+                cur_line = pc_lineMap[instr.ip]
+                if showDisas:
+                    print(cur_line)
+                
+            elif cur_line != -1:
+                line_pcsMap[cur_line].add(instr.ip)
+
+            if showDisas: 
+                print(f'{instr.ip:0X}: {formatter.format(instr)}')
+
+        # print(line_pcsMap)
+        factory = InstructionInfoFactory()
+        # info = factory.info(pc_instMap[4])
+        # mem = info.used_memory()[0]
+        # const = decoder.get_constant_offsets(pc_instMap[4])
+        # print(dir(const))
+        # print(const.__str__())
+        # print(f'{int(mem.displacement)}')
+        # print(op_access_to_str[mem.access])
+        # print(reg_to_str[mem.base])
+        # print(reg_to_str[mem.index])
+
+        mx = max(line_pcsMap.keys())
+        for line in line_pcsMap.keys():
+            if(line == mx):
+                continue
+            pcs = line_pcsMap[line]
+            line_instMap[line] = []
+            for pc in pcs:
+                if pc in pc_instMap:
+                    instr = pc_instMap[pc]
+                else:
+                    continue
+                # if self.hasMem(instr):
+                #     for ins in line_instMap[line]:
+                #         if self.hasMem(ins) and self.sameMem(ins, instr):
+                #             if line not in problems:
+                #                 problems[line] = set()
+                #             problems[line].add(instr)
+                #             problems[line].add(ins)
+
+                line_instMap[line].append(instr)
+
+        if(isGroup):
+            for group in lineGroups:
+                group = [int(no) for no in group.split()]
+                inslst = []
+                for line in group:
+                    if line in line_instMap.keys() and line != mx:
+                        inslst.extend(line_instMap[line])
+                for i in inslst:
+                    for j in inslst:
+                        if not i is j and self.hasMem(i) and self.hasMem(j) and self.sameMem(i, j)\
+                            and self.is_read(factory.info(i).used_memory()[0] ,op_access_to_str) and self.is_read(factory.info(j).used_memory()[0] ,op_access_to_str):
+                            if group[0] not in problems:    # use some line in group as index
+                                problems[group[0]] = set()
+                            problems[group[0]].add(i)
+                            problems[group[0]].add(j)
+        else:
+            for line in lineGroups:
+                line = int(line)
+                if line == mx or not line in line_instMap.keys():
+                    continue
+                for i in line_instMap[line]:
+                    for j in line_instMap[line]:
+                        if not i is j and self.hasMem(i) and self.hasMem(j) and self.sameMem(i, j)\
+                            and self.is_read(factory.info(i).used_memory()[0] ,op_access_to_str) and self.is_read(factory.info(j).used_memory()[0] ,op_access_to_str):
+                            if line not in problems:
+                                problems[line] = set()
+                            problems[line].add(i)
+                            problems[line].add(j)
+
+
+        if problems:
+            print(inputLine)
+            head = "duplicate:"
+            if isGroup:
+                head+=" (group)"
+            for line in problems.keys():
+                print(line)
+                for instr in problems[line]:
+                    disas = formatter.format(instr)
+                    print(f"{instr.ip:X}: {disas}")
+            print("")
+            exit(1)
+        
+
 
 SCRIPT_DESCRIPTION = 'Display information about the contents of ELF format files'
 VERSION_STRING = '%%(prog)s: based on pyelftools %s' % __version__
@@ -1986,6 +2243,9 @@ def main(stream=None):
     argparser.add_argument('--show_locals', 
             action='store_true', dest='showLocal',
             help=('show locals used in each instructions'))
+    argparser.add_argument('--check_loads',
+            action="store", dest="checkGuide", metavar="<json file>",
+            help=('check whether compiler-introduced double fetch'))
 
     args = argparser.parse_args()
 
@@ -2034,6 +2294,9 @@ def main(stream=None):
             if args.showLocal:
                 print("ready for show locals")
                 readelf.show_locals()
+            if args.checkGuide:
+                readelf.check_loads(args.checkGuide)
+
         except ELFError as ex:
             sys.stdout.flush()
             sys.stderr.write('ELF error: %s\n' % ex)
