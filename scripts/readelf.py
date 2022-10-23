@@ -10,6 +10,8 @@
 import argparse
 from curses.ascii import isgraph
 from dis import Instruction
+from fileinput import filename
+from nis import match
 import os, sys
 from symbol import factor
 import string
@@ -1225,6 +1227,7 @@ class ReadElf(object):
                 else:
                     # In readelf, on non-VLIW machines there is no op_index postfix after address.
                     # It used to be unconditional.
+                    print(dir(state))
                     self._emitline('%-35s  %s  %18s%s %s' % (
                         bytes2str(lineprogram['file_entry'][state.file - 1].name),
                         "%11d" % (state.line,) if not state.end_sequence else '-',
@@ -2018,6 +2021,15 @@ class ReadElf(object):
     def is_read(self, mem:UsedMemory, mp:dict) -> bool:
         return mp[mem.access] == "READ"
 
+    def getLine(self, file:str, addr:int) -> int:
+        out = os.popen(f"addr2line --exe {file} {addr:X} -p --demangle --basenames").read()
+        matches = re.findall(r':(\d+)', out)
+        if matches:
+            assert(len(matches)==1)
+            return int(matches[0])
+        else:
+            return None
+
     def check_loads(self, checkGuide):
         '''
         check whether there's compiler-introduced double fetch
@@ -2030,11 +2042,12 @@ class ReadElf(object):
         isGroup = False
         '''
         process guide file from coccinelle's match result
-        [ file:str, [ lineNo:int | [lineNo:int] ] ]
+        [ file:str, [ lineNo:int | "lineNo lineNo ..." ] ]
         '''
         with open(checkGuide, "r+") as js:
             inputLine = json.loads(js.readline())
             assert(len(inputLine)==2)
+            fileName = inputLine[0].replace("./repo", "/root")
             lineGroups = inputLine[1]
             if len(lineGroups):
                 isGroup = " " in lineGroups[0]
@@ -2042,11 +2055,12 @@ class ReadElf(object):
                 exit(0)
 
 
-        line_pcsMap = {}     # int -> set(int)
-        pc_lineMap = {}      # for gathering homeless instructions
+        # line_pcsMap = {}     # int -> set(int)
+        # pc_lineMap = {}      # for gathering homeless instructions
         pc_instMap = {}
-        line_instMap = {}    # int -> list[Instruction]
-        problems = {}        # int -> set(Instruction)
+        inst_lineMap = {}   # Instruction -> int 
+        line_instMap = {}   # int -> list[Instruction]
+        problems = {}        # str -> set(int) # can't use set(Instruction) because two instruction with the same function at different ip would be equal
 
         self._init_dwarfinfo()
         if self._dwarfinfo is None:
@@ -2056,20 +2070,6 @@ class ReadElf(object):
         if not self._dwarfinfo.has_debug_info:
             return
         
-
-        for cu in self._dwarfinfo.iter_CUs():
-            lineprogram = self._dwarfinfo.line_program_for_CU(cu)
-            for entry in lineprogram.get_entries():
-                if entry.state is None:
-                    continue
-                state = entry.state # state is defined by DWARF4 6.2.2
-                if not state.end_sequence: 
-                    if state.line not in line_pcsMap:
-                        line_pcsMap[state.line] = set()
-                    line_pcsMap[state.line].add(state.address)
-                    pc_lineMap[state.address] = state.line
-
-
         code = self.elffile.get_section_by_name('.text')
         addr = code['sh_addr']
         # print(f'code addr: {addr}')
@@ -2080,93 +2080,115 @@ class ReadElf(object):
         reg_to_str = self.create_enum_dict(Register)
         op_access_to_str = self.create_enum_dict(OpAccess)
 
-        cur_line = -1
-        for instr in decoder:
-            pc_instMap[instr.ip] = instr
-            if instr.ip in pc_lineMap:
-                cur_line = pc_lineMap[instr.ip]
-                if showDisas:
-                    print(cur_line)
+        '''
+        deprecated because not accurate, applicable .debug_line analysis is complicated
+        '''
+        # for cu in self._dwarfinfo.iter_CUs():
+        #     lineprogram = self._dwarfinfo.line_program_for_CU(cu)
+        #     for entry in lineprogram.get_entries():
+        #         if entry.state is None:
+        #             continue
+        #         state = entry.state # state is defined by DWARF4 6.2.2
+        #         if not state.end_sequence: 
+        #             if state.line not in line_pcsMap:
+        #                 line_pcsMap[state.line] = set()
+        #             line_pcsMap[state.line].add(state.address)
+        #             pc_lineMap[state.address] = state.line
+        # 
+        # cur_line = -1
+        # for instr in decoder:
+        #     pc_instMap[instr.ip] = instr    #这里有点乱
+        #     if instr.ip in pc_lineMap:
+        #         cur_line = pc_lineMap[instr.ip]
+        #         if showDisas:
+        #             print(cur_line)
                 
-            elif cur_line != -1:
-                line_pcsMap[cur_line].add(instr.ip)
+        #     elif cur_line != -1:
+        #         line_pcsMap[cur_line].add(instr.ip)
 
-            if showDisas: 
-                print(f'{instr.ip:0X}: {formatter.format(instr)}')
+        #     if showDisas: 
+        #         print(f'{instr.ip:0X}: {formatter.format(instr)}')
+        # 
+        # 
+        # mx = max(line_pcsMap.keys())
+        # for line in line_pcsMap.keys():
+        #     if(line == mx):
+        #         continue
+        #     pcs = line_pcsMap[line]
+        #     line_instMap[line] = []
+        #     for pc in pcs:
+        #         if pc in pc_instMap:
+        #             instr = pc_instMap[pc]
+        #         else:
+        #             continue
+        #         line_instMap[line].append(instr)
 
-        # print(line_pcsMap)
+        # count = 0
+        for instr in decoder:
+            # count +=1 
+            line = self.getLine(fileName.replace(".c", ".o"), instr.ip)
+            if not line:
+                continue
+            pc_instMap[instr.ip] = instr
+            if line not in line_instMap.keys():
+                line_instMap[line] = []
+            line_instMap[line].append(instr)
+            inst_lineMap[instr] = line
+            if showDisas:
+                dumpInstr = f'{instr.ip:<4X}: {formatter.format(instr):<30} #{line}'
+                print(dumpInstr)
+
+            # if(count%100==0):
+            #     print(f'{count} instruction located')
+
         factory = InstructionInfoFactory()
         # info = factory.info(pc_instMap[4])
         # mem = info.used_memory()[0]
         # const = decoder.get_constant_offsets(pc_instMap[4])
-        # print(dir(const))
-        # print(const.__str__())
         # print(f'{int(mem.displacement)}')
         # print(op_access_to_str[mem.access])
         # print(reg_to_str[mem.base])
         # print(reg_to_str[mem.index])
 
-        mx = max(line_pcsMap.keys())
-        for line in line_pcsMap.keys():
-            if(line == mx):
-                continue
-            pcs = line_pcsMap[line]
-            line_instMap[line] = []
-            for pc in pcs:
-                if pc in pc_instMap:
-                    instr = pc_instMap[pc]
-                else:
-                    continue
-                # if self.hasMem(instr):
-                #     for ins in line_instMap[line]:
-                #         if self.hasMem(ins) and self.sameMem(ins, instr):
-                #             if line not in problems:
-                #                 problems[line] = set()
-                #             problems[line].add(instr)
-                #             problems[line].add(ins)
-
-                line_instMap[line].append(instr)
-
+        mx = max(line_instMap.keys())
         if(isGroup):
             for group in lineGroups:
-                group = [int(no) for no in group.split()]
+                groupNums = [int(no) for no in group.split()]
                 inslst = []
-                for line in group:
+                for line in groupNums:
                     if line in line_instMap.keys() and line != mx:
                         inslst.extend(line_instMap[line])
                 for i in inslst:
                     for j in inslst:
                         if not i is j and self.hasMem(i) and self.hasMem(j) and self.sameMem(i, j)\
                             and self.is_read(factory.info(i).used_memory()[0] ,op_access_to_str) and self.is_read(factory.info(j).used_memory()[0] ,op_access_to_str):
-                            if group[0] not in problems:    # use some line in group as index
-                                problems[group[0]] = set()
-                            problems[group[0]].add(i)
-                            problems[group[0]].add(j)
+                            if group not in problems:    # use some line in group as index
+                                problems[group] = set()
+                            problems[group].add(i.ip)
+                            problems[group].add(j.ip)
         else:
             for line in lineGroups:
-                line = int(line)
-                if line == mx or not line in line_instMap.keys():
+                lineNo = int(line)
+                if lineNo == mx or not lineNo in line_instMap.keys():
                     continue
-                for i in line_instMap[line]:
-                    for j in line_instMap[line]:
+                for i in line_instMap[lineNo]:
+                    for j in line_instMap[lineNo]:
                         if not i is j and self.hasMem(i) and self.hasMem(j) and self.sameMem(i, j)\
                             and self.is_read(factory.info(i).used_memory()[0] ,op_access_to_str) and self.is_read(factory.info(j).used_memory()[0] ,op_access_to_str):
                             if line not in problems:
                                 problems[line] = set()
-                            problems[line].add(i)
-                            problems[line].add(j)
+                            problems[line].add(i.ip)
+                            problems[line].add(j.ip)
 
 
         if problems:
             print(inputLine)
-            head = "duplicate:"
-            if isGroup:
-                head+=" (group)"
             for line in problems.keys():
-                print(line)
-                for instr in problems[line]:
+                print("problematic line(s): " + line)
+                for ip in problems[line]:
+                    instr = pc_instMap[ip]
                     disas = formatter.format(instr)
-                    print(f"{instr.ip:X}: {disas}")
+                    print(f"{instr.ip:<4X}: {disas:<30} {inst_lineMap[instr]}")
             print("")
             exit(1)
         

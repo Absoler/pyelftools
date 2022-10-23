@@ -1,0 +1,29 @@
+#! /bin/bash
+# dir="/root/linux-master/"
+# files=(`cat ./objs`)
+# >loads
+# for file in ${files[*]} ; do
+#     file=${file#.\/repo\/linux-master\/}
+#     python3 scripts/readelf.py --check_loads $dir${file%\.c}.o
+#     if [ $? -ne 0 ] ; then
+#         echo $file
+#         echo ""
+#     fi
+# done
+
+function get_file_name(){
+    local file=${1#*.\/repo\/linux-master\/}
+    echo ${file%%\"*}
+}
+dir="/root/linux-master/"
+> run.log
+while read line ; do
+    file=$(get_file_name $line)
+    echo "$line" > scripts/guide.json
+    python3 scripts/readelf.py --check_loads scripts/guide.json $dir${file%\.c}.o >> run.log
+    if [ $? -ne 0 ] ; then
+        echo trigger on $line
+    else
+        echo nothin at $line
+    fi
+done < where.json
