@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python3
 #-------------------------------------------------------------------------------
 # scripts/readelf.py
 #
@@ -8,18 +8,14 @@
 # This code is in the public domain
 #-------------------------------------------------------------------------------
 import argparse
-from curses.ascii import isgraph
-from dis import Instruction
-from fileinput import filename
-from nis import match
 import os, sys
-from symbol import factor
 import string
 import traceback
 import itertools
 import re
 import json
 import ctypes
+import time
 # Note: zip has different behaviour between Python 2.x and 3.x.
 # - Using izip ensures compatibility.
 try:
@@ -468,7 +464,7 @@ class ReadElf(object):
                     symbol_name = self.elffile.get_section(symbol['st_shndx']).name
 
                 # symbol names are truncated to 25 chars, similarly to readelf
-                self._emitline('%6d: %s %s %-7s %-6s %-7s %4s %.25s%s' % (
+                self._emitline('%6d: %s %s %-7s %-6s %-7s %4s %.40s%s' % (
                     nsym,
                     self._format_hex(
                         symbol['st_value'], fullhex=True, lead0x=False),
@@ -1696,7 +1692,7 @@ class ReadElf(object):
          it must be [ rbp/rsp + displacement ]
         '''
         if ( (ins.memory_base == Register.RSP or ins.memory_base ==Register.RBP) and ins.memory_index == Register.NONE
-            or (ins.memory_index == Register.RSP or ins.memory_index == Register.RBP) and ins.memory_base == Register.NONE ):
+            or (ins.memory_index == Register.RSP or ins.memory_index == Register.RBP) and ins.memory_base == Register.NONE and ins.memory_index_scale == 1):
             return True
         return False
 
@@ -1962,7 +1958,7 @@ class ReadElf(object):
             if not self.check_addr(instr):
                 continue
             
-            assert(instr.memory_index_scale == 1)
+            # assert(instr.memory_index_scale == 1)
             assert(instr.memory_index == Register.NONE)
 
             # now we only consider the simplest case, [ rbp/rsp + displacement ]"
@@ -1970,39 +1966,40 @@ class ReadElf(object):
             
 
             if (instr.memory_base == Register.RSP):
-                # num="0"
-                # if(disasm[s+3]!=']'):
-                #     t = len(disasm)
-                #     for pat in end_pat:
-                #         tmp = disasm.find(pat, s)
-                #         if(tmp!=-1):
-                #             t = min(t, tmp)
-                #     num = int(disasm[s+3:t], 16)
-                # print(f'\trsp+{num}')
-                local = current_mgr.getVar(instr.ip, 'rsp', instr.memory_displacement)
+                
+                local = current_mgr.getVar(instr.ip, 'rsp', ctypes.c_int32(instr.memory_displacement).value)
                 if(local):
                     dump_instr += local
                 # print(f'{current_mgr.getVar(instr.ip, "rsp", num)}')
             
             elif (instr.memory_base == Register.RBP):
 
-                local = current_mgr.getVar(instr.ip, 'rbp', instr.memory_displacement)
+                local = current_mgr.getVar(instr.ip, 'rbp', ctypes.c_int32(instr.memory_displacement).value)
                 if(local):
                     dump_instr += local
+                # print(f'{current_mgr.getVar(instr.ip, "rbp", num)}')
             
             print(dump_instr)
 
     def hasMem(self, instr) -> bool:
+        # lea inst doesn't access the memory
+        if instr.mnemonic == Mnemonic.LEA:
+            return False
         for i in range(instr.op_count):
             if(instr.op_kind(i) == OpKind.MEMORY):
                 return True
         return False
     
     def sameMem(self, i:Instruction, j:Instruction):
-        return i.memory_base == j.memory_base and \
+        if  i.memory_base == Register.RIP and \
+            j.memory_base == Register.RIP:
+            return True
+        if  i.memory_base == j.memory_base and \
                 i.memory_index == j.memory_index and \
                 i.memory_index_scale == j.memory_index_scale and \
-                i.memory_displacement == j.memory_displacement
+                i.memory_displacement == j.memory_displacement:
+            return True
+        return False
     
     def getRealLine(self, line:int, lines:list, err:int) -> int:
         mx = max(lines)
@@ -2018,17 +2015,20 @@ class ReadElf(object):
         '''
         return {module.__dict__[key]:key for key in module.__dict__ if isinstance(module.__dict__[key], int)}
 
-    def is_read(self, mem:UsedMemory, mp:dict) -> bool:
-        return mp[mem.access] == "READ"
+    def is_read(self, mem:UsedMemory) -> bool:
+        return mem.access == OpAccess.READ or mem.access == OpAccess.READ_WRITE\
+            or mem.access ==OpAccess.COND_READ or mem.access == OpAccess.READ_COND_WRITE
 
-    def getLine(self, file:str, addr:int) -> int:
-        out = os.popen(f"addr2line --exe {file} {addr:X} -p --demangle --basenames").read()
-        matches = re.findall(r':(\d+)', out)
-        if matches:
-            assert(len(matches)==1)
-            return int(matches[0])
+    def getLine(self, file:str, addr:int):
+        out = os.popen(f"addr2line --exe {file} {addr:X} -p --demangle -f").read()
+        matchFunc = re.findall(r'([a-zA-Z0-9_]+) at', out)
+        matcheLine = re.findall(r':(\d+)', out)
+        if matcheLine and matchFunc:
+            assert(len(matcheLine)==1)
+            assert(len(matchFunc)==1)
+            return int(matcheLine[0]), matchFunc[0]
         else:
-            return None
+            return (None, None)
 
     def check_loads(self, checkGuide):
         '''
@@ -2036,31 +2036,61 @@ class ReadElf(object):
         ### conditions:
         1. duplicate address used in instructions from the same line
         '''
-
+        startTime = 0
         # some control options
         showDisas = False
-        isGroup = False
+        error = 2   # permissible lineNo error
+        showTime = False
         '''
         process guide file from coccinelle's match result
         [ file:str, [ lineNo:int | "lineNo lineNo ..." ] ]
         '''
+        if showTime:
+            startTime = time.time()
+
+        lineGroups = [] # [ [int ], [int ] .. ]
         with open(checkGuide, "r+") as js:
             inputLine = json.loads(js.readline())
             assert(len(inputLine)==2)
             fileName = inputLine[0].replace("./repo", "/root")
-            lineGroups = inputLine[1]
-            if len(lineGroups):
-                isGroup = " " in lineGroups[0]
-            else:
+
+            # init lineGroups
+            lineStrs = inputLine[1]   # [ str ] 
+            if len(lineStrs) == 0:
                 exit(0)
+            for s in lineStrs:
+                if " " in s:
+                    lineGroups.append([int(no) for no in s.split()])
+                else:
+                    lineGroups.append([int(s)])
+            del lineStrs
+
+            for i, group in enumerate(lineGroups):
+                for lineNo in group[:]:
+                    for err in range(1, error+1):
+                        lineGroups[i].append(lineNo+err)
+                        lineGroups[i].append(lineNo-err)
+                lineGroups[i] = list(set(group))
+
+        if showTime:
+            print(f'process guide file: {time.time()-startTime:.6}s')
 
 
         # line_pcsMap = {}     # int -> set(int)
-        # pc_lineMap = {}      # for gathering homeless instructions
+        pc_lineMap = {}      # for gathering homeless instructions
         pc_instMap = {}
         inst_lineMap = {}   # Instruction -> int 
         line_instMap = {}   # int -> list[Instruction]
         problems = {}        # str -> set(int) # can't use set(Instruction) because two instruction with the same function at different ip would be equal
+
+        allFunc = set()  # set(str) save all function names from symtable
+        symsec = self.elffile.get_section_by_name(".symtab")
+        if not symsec:
+            print("no .symtab in elf")
+            return
+        for sym in symsec.iter_symbols():
+            if "STT_FUNC" == sym['st_info']['type']:
+                allFunc.add(sym.name)
 
         self._init_dwarfinfo()
         if self._dwarfinfo is None:
@@ -2070,18 +2100,29 @@ class ReadElf(object):
         if not self._dwarfinfo.has_debug_info:
             return
         
-        code = self.elffile.get_section_by_name('.text')
-        addr = code['sh_addr']
+        if showTime:
+            print(f'get func names: {time.time()-startTime:.6}s')
+
+        text = self.elffile.get_section_by_name('.text')
+        addr = text['sh_addr']
         # print(f'code addr: {addr}')
-        code = code.data()
+        code = text.data()
+        if len(code) == 0:
+            code = text.stream.read()
+            print("can't get data() from .text section")
+            
         decoder = Decoder(64, code, ip=addr)
+        if not decoder.can_decode:
+            print("can't decode code")
+            return
         formatter = Formatter(FormatterSyntax.INTEL)
         
-        reg_to_str = self.create_enum_dict(Register)
+        # reg_to_str = self.create_enum_dict(Register)
         op_access_to_str = self.create_enum_dict(OpAccess)
 
         '''
         deprecated because not accurate, applicable .debug_line analysis is complicated
+        '''
         '''
         # for cu in self._dwarfinfo.iter_CUs():
         #     lineprogram = self._dwarfinfo.line_program_for_CU(cu)
@@ -2122,24 +2163,36 @@ class ReadElf(object):
         #         else:
         #             continue
         #         line_instMap[line].append(instr)
+        '''
 
-        # count = 0
+        count = 0
         for instr in decoder:
-            # count +=1 
-            line = self.getLine(fileName.replace(".c", ".o"), instr.ip)
+            count +=1 #继续写拿到名字后的东西
+            line, funcName = self.getLine(fileName.replace(".c", ".o"), instr.ip)
             if not line:
                 continue
+            
+            funcExist = False
+            for func in allFunc:
+                if funcName in func:
+                    funcExist = True
+                    break
+            if not funcExist:
+                continue
+            
             pc_instMap[instr.ip] = instr
             if line not in line_instMap.keys():
                 line_instMap[line] = []
             line_instMap[line].append(instr)
-            inst_lineMap[instr] = line
+            pc_lineMap[instr.ip] = line
+            # assert(instr not in inst_lineMap.keys())
+            # inst_lineMap[instr] = line
             if showDisas:
-                dumpInstr = f'{instr.ip:<4X}: {formatter.format(instr):<30} #{line}'
+                dumpInstr = f'{instr.ip:<4X}: {formatter.format(instr):<30} #{line} in {funcName}'
                 print(dumpInstr)
 
-            # if(count%100==0):
-            #     print(f'{count} instruction located')
+        if showTime:
+            print(f'process {count} insts: {time.time()-startTime:.6}s')
 
         factory = InstructionInfoFactory()
         # info = factory.info(pc_instMap[4])
@@ -2151,35 +2204,25 @@ class ReadElf(object):
         # print(reg_to_str[mem.index])
 
         mx = max(line_instMap.keys())
-        if(isGroup):
-            for group in lineGroups:
-                groupNums = [int(no) for no in group.split()]
-                inslst = []
-                for line in groupNums:
-                    if line in line_instMap.keys() and line != mx:
-                        inslst.extend(line_instMap[line])
-                for i in inslst:
-                    for j in inslst:
-                        if not i is j and self.hasMem(i) and self.hasMem(j) and self.sameMem(i, j)\
-                            and self.is_read(factory.info(i).used_memory()[0] ,op_access_to_str) and self.is_read(factory.info(j).used_memory()[0] ,op_access_to_str):
-                            if group not in problems:    # use some line in group as index
-                                problems[group] = set()
-                            problems[group].add(i.ip)
-                            problems[group].add(j.ip)
-        else:
-            for line in lineGroups:
-                lineNo = int(line)
-                if lineNo == mx or not lineNo in line_instMap.keys():
-                    continue
-                for i in line_instMap[lineNo]:
-                    for j in line_instMap[lineNo]:
-                        if not i is j and self.hasMem(i) and self.hasMem(j) and self.sameMem(i, j)\
-                            and self.is_read(factory.info(i).used_memory()[0] ,op_access_to_str) and self.is_read(factory.info(j).used_memory()[0] ,op_access_to_str):
-                            if line not in problems:
-                                problems[line] = set()
-                            problems[line].add(i.ip)
-                            problems[line].add(j.ip)
+        for group in lineGroups:
+            inslst = []
+            for line in group:
+                if line in line_instMap.keys() and line != mx:
+                    inslst.extend(line_instMap[line])
 
+            for i in inslst:
+                for j in inslst:
+                    if not i is j and self.hasMem(i) and self.hasMem(j) and self.sameMem(i, j)\
+                        and len(factory.info(i).used_memory()) > 0 and self.is_read(factory.info(i).used_memory()[0])\
+                        and len(factory.info(j).used_memory()) > 0 and self.is_read(factory.info(j).used_memory()[0]):
+                        groupDesc = "-".join([str(v) for v in group])
+                        if groupDesc not in problems:    # use some line in group as index
+                            problems[groupDesc] = set()
+                        problems[groupDesc].add(i.ip)
+                        problems[groupDesc].add(j.ip)
+
+        if showTime:
+            print(f'analysis: {time.time()-startTime:.6}')
 
         if problems:
             print(inputLine)
@@ -2188,7 +2231,7 @@ class ReadElf(object):
                 for ip in problems[line]:
                     instr = pc_instMap[ip]
                     disas = formatter.format(instr)
-                    print(f"{instr.ip:<4X}: {disas:<30} {inst_lineMap[instr]}")
+                    print(f"{instr.ip:<4X}: {disas:<30} {pc_lineMap[instr.ip]}")
             print("")
             exit(1)
         

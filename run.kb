@@ -16,14 +16,28 @@ function get_file_name(){
     echo ${file%%\"*}
 }
 dir="/root/linux-master/"
-> run.log
+
+cnt=0
+hit=0
+if [ $# -ge 1 ] ; then
+    start=$1
+else
+    start=0
+fi
 while read line ; do
+    if [ $start -gt 0 ] ; then
+        ((start--))
+        continue
+    fi
     file=$(get_file_name $line)
     echo "$line" > scripts/guide.json
     python3 scripts/readelf.py --check_loads scripts/guide.json $dir${file%\.c}.o >> run.log
     if [ $? -ne 0 ] ; then
         echo trigger on $line
+        ((hit++))
     else
-        echo nothin at $line
+        echo nothing at $line
     fi
+    ((cnt++))
 done < where.json
+echo trigger $hit / $cnt
