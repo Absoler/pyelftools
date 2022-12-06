@@ -2036,6 +2036,9 @@ class ReadElf(object):
         ### conditions:
         1. duplicate address used in instructions from the same line
         '''
+
+        # some important vars
+        objdumpPath = "/root/binutils-gdb/build/binutils/objdump"
         startTime = 0
         # some control options
         showDisas = False
@@ -2079,7 +2082,7 @@ class ReadElf(object):
         # line_pcsMap = {}     # int -> set(int)
         pc_lineMap = {}      # for gathering homeless instructions
         pc_instMap = {}
-        inst_lineMap = {}   # Instruction -> int 
+      
         line_instMap = {}   # int -> list[Instruction]
         problems = {}        # str -> set(int) # can't use set(Instruction) because two instruction with the same function at different ip would be equal
 
@@ -2088,7 +2091,7 @@ class ReadElf(object):
         if not symsec:
             print("no .symtab in elf")
             return
-        for sym in symsec.iter_symbols():
+        for sym in symsec.iter_symbols():   # forget, may avoid inline?
             if "STT_FUNC" == sym['st_info']['type']:
                 allFunc.add(sym.name)
 
@@ -2165,32 +2168,73 @@ class ReadElf(object):
         #         line_instMap[line].append(instr)
         '''
 
-        count = 0
-        for instr in decoder:
-            count +=1 #继续写拿到名字后的东西
-            line, funcName = self.getLine(fileName.replace(".c", ".o"), instr.ip)
-            if not line:
+        funcFlag = ";"
+        lineFlag = ":"
+        
+        lines = os.popen(f"{objdumpPath} -dl {fileName.replace('.c', '.o')}").readlines()
+        funcName = ""
+        file, lineNo = "", -1
+        addr = -1 
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if len(line) == 0:
                 continue
+            # if no "()" then "demangle" in line
+            if funcFlag in line:
+                funcName = re.findall(r'(.*)\(\)', line)[0]
+                assert(len(funcName)>0)
+            elif lineFlag in line:
+                file, lineNo = line.split(":")
+                lineNo = int(lineNo)
+            else:
+                addr = int(line, 16)
+                
+                funcExist = funcName!=""
+                for func in allFunc:
+                    if funcName in func:
+                        funcExist = True
+                        break
+                '''
+                many of disassembly belong to inline funcs from other files, and now I
+                block them, this may cause no fn because the var-use I care basically
+                belong to the current file, not in a function call
+                '''
+                
+                if funcExist and\
+                    file.split("/")[-1] == fileName.split("/")[-1]:
+                    pc_lineMap[addr] = lineNo
             
-            funcExist = False
-            for func in allFunc:
-                if funcName in func:
-                    funcExist = True
-                    break
-            if not funcExist:
+
+        count, lose = 0, 0
+        for instr in decoder:
+            count +=1
+            # line, funcName = self.getLine(fileName.replace(".c", ".o"), instr.ip)
+            # if not line:
+            #     continue
+            
+            # funcExist = False
+            # for func in allFunc:
+            #     if funcName in func:
+            #         funcExist = True
+            #         break
+            # if not funcExist:
+            #     continue
+            if instr.ip not in pc_lineMap:
+                # print(f"lose {instr.ip:X}")
+                lose+=1
                 continue
+            line = pc_lineMap[instr.ip]
             
             pc_instMap[instr.ip] = instr
             if line not in line_instMap.keys():
                 line_instMap[line] = []
             line_instMap[line].append(instr)
-            pc_lineMap[instr.ip] = line
-            # assert(instr not in inst_lineMap.keys())
-            # inst_lineMap[instr] = line
+
+   
             if showDisas:
                 dumpInstr = f'{instr.ip:<4X}: {formatter.format(instr):<30} #{line} in {funcName}'
                 print(dumpInstr)
-
+        # print(f"lose {lose}/{count}")
         if showTime:
             print(f'process {count} insts: {time.time()-startTime:.6}s')
 
