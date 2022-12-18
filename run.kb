@@ -11,16 +11,16 @@
 #     fi
 # done
 
+# args[1] must be the json item
 function get_file_name(){
-    local file=${1#*.\/repo\/linux-master\/}
+    local file=${1#\[\"}
     echo ${file%%\"*}
 }
-dir="/root/linux-master/"
 
 cnt=0
 hit=0
-if [ $# -ge 1 ] ; then
-    start=$1
+if [ $# -ge 2 ] ; then
+    start=$2
 else
     start=0
 fi
@@ -31,7 +31,7 @@ while read line ; do
     fi
     file=$(get_file_name $line)
     echo "$line" > scripts/guide.json
-    python3 scripts/readelf.py --check_loads scripts/guide.json $dir${file%\.c}.o >> run.log
+    python3 scripts/readelf.py --check_loads scripts/guide.json ${file%\.c}.o >> run.log    # assuming .o file locates at the same directory
     if [ $? -ne 0 ] ; then
         echo trigger on $line
         ((hit++))
@@ -39,5 +39,5 @@ while read line ; do
         echo nothing at $line
     fi
     ((cnt++))
-done < where.json
+done < $1
 echo trigger $hit / $cnt

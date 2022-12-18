@@ -2043,7 +2043,13 @@ class ReadElf(object):
         # some control options
         showDisas = False
         error = 2   # permissible lineNo error
+        special_error = 10 # for special check, relax restrictions
         showTime = False
+
+        normalCheck = 0
+        checkIfMultiCmp = 0
+        checkIfRefresh = 1
+
         '''
         process guide file from coccinelle's match result
         [ file:str, [ lineNo:int | "lineNo lineNo ..." ] ]
@@ -2052,6 +2058,7 @@ class ReadElf(object):
             startTime = time.time()
 
         lineGroups = [] # [ [int ], [int ] .. ]
+        relativeLines = []  # for special check
         with open(checkGuide, "r+") as js:
             inputLine = json.loads(js.readline())
             assert(len(inputLine)==2)
@@ -2074,6 +2081,11 @@ class ReadElf(object):
                         lineGroups[i].append(lineNo+err)
                         lineGroups[i].append(lineNo-err)
                 lineGroups[i] = list(set(group))
+                for lineNo in group[:]:
+                    for err in range(1, special_error+1):
+                        relativeLines.append(lineNo+err)
+                        relativeLines.append(lineNo-err)
+            relativeLines = list(set(relativeLines))
 
         if showTime:
             print(f'process guide file: {time.time()-startTime:.6}s')
@@ -2082,7 +2094,9 @@ class ReadElf(object):
         # line_pcsMap = {}     # int -> set(int)
         pc_lineMap = {}      # for gathering homeless instructions
         pc_instMap = {}
-      
+        pcs = []    # addresses of all instructions, sorted
+        insts = []  # all instructions, sorted
+
         line_instMap = {}   # int -> list[Instruction]
         problems = {}        # str -> set(int) # can't use set(Instruction) because two instruction with the same function at different ip would be equal
 
@@ -2122,7 +2136,8 @@ class ReadElf(object):
         
         # reg_to_str = self.create_enum_dict(Register)
         op_access_to_str = self.create_enum_dict(OpAccess)
-
+        code_to_str = self.create_enum_dict(Code)
+        opKindDict = self.create_enum_dict(OpKind)
         '''
         deprecated because not accurate, applicable .debug_line analysis is complicated
         '''
@@ -2195,14 +2210,19 @@ class ReadElf(object):
                         funcExist = True
                         break
                 '''
-                many of disassembly belong to inline funcs from other files, and now I
-                block them, this may cause no fn because the var-use I care basically
+                many of disassembly belong to inline funcs from other files (.h e.g.), and now I
+                try to avoid them, this may cause no fn because the var-use I care basically
                 belong to the current file, not in a function call
                 '''
                 
                 if funcExist and\
                     file.split("/")[-1] == fileName.split("/")[-1]:
-                    pc_lineMap[addr] = lineNo
+                    if addr not in pc_lineMap:
+                    # ! readelf can't get `.text` section accurately, and it may mix
+                    #   with `.text.startup`, so some map may be overrided
+                    # comments: ip is based on current section, so main() in `.text.startup`
+                    # may start from 0x0 as the same as func_1() in `text`   
+                        pc_lineMap[addr] = lineNo
             
 
         count, lose = 0, 0
@@ -2224,7 +2244,8 @@ class ReadElf(object):
                 lose+=1
                 continue
             line = pc_lineMap[instr.ip]
-            
+            pcs.append(instr.ip)
+
             pc_instMap[instr.ip] = instr
             if line not in line_instMap.keys():
                 line_instMap[line] = []
@@ -2238,6 +2259,11 @@ class ReadElf(object):
         if showTime:
             print(f'process {count} insts: {time.time()-startTime:.6}s')
 
+        pcs.sort()
+        for pc in pcs:
+            insts.append(pc_instMap[pc])
+        
+
         factory = InstructionInfoFactory()
         # info = factory.info(pc_instMap[4])
         # mem = info.used_memory()[0]
@@ -2248,22 +2274,33 @@ class ReadElf(object):
         # print(reg_to_str[mem.index])
 
         mx = max(line_instMap.keys())
-        for group in lineGroups:
-            inslst = []
-            for line in group:
-                if line in line_instMap.keys() and line != mx:
-                    inslst.extend(line_instMap[line])
+        if normalCheck:
+            for group in lineGroups:
+                inslst = []
+                for line in group:
+                    if line in line_instMap.keys() and line != mx:
+                        inslst.extend(line_instMap[line])
 
-            for i in inslst:
-                for j in inslst:
-                    if not i is j and self.hasMem(i) and self.hasMem(j) and self.sameMem(i, j)\
-                        and len(factory.info(i).used_memory()) > 0 and self.is_read(factory.info(i).used_memory()[0])\
-                        and len(factory.info(j).used_memory()) > 0 and self.is_read(factory.info(j).used_memory()[0]):
-                        groupDesc = "-".join([str(v) for v in group])
-                        if groupDesc not in problems:    # use some line in group as index
-                            problems[groupDesc] = set()
-                        problems[groupDesc].add(i.ip)
-                        problems[groupDesc].add(j.ip)
+                for i in inslst:
+                    for j in inslst:
+                        if not i is j and self.hasMem(i) and self.hasMem(j) and self.sameMem(i, j)\
+                            and len(factory.info(i).used_memory()) > 0 and self.is_read(factory.info(i).used_memory()[0])\
+                            and len(factory.info(j).used_memory()) > 0 and self.is_read(factory.info(j).used_memory()[0]):
+                            groupDesc = "-".join([str(v) for v in group])
+                            if groupDesc not in problems:    # use some line in group as index
+                                problems[groupDesc] = set()
+                            problems[groupDesc].add(i.ip)
+                            problems[groupDesc].add(j.ip)
+
+        
+        for i, pc in enumerate(pcs):
+            if pc in pc_lineMap and pc_lineMap[pc] in relativeLines:
+                if checkIfMultiCmp and self.checkIfMultiCmp(i, insts, code_to_str, opKindDict, pc_lineMap) or\
+                    checkIfRefresh and self.checkIfRefresh(i, insts, code_to_str, opKindDict):
+                    line_str = str(pc_lineMap[pc])
+                    if line_str not in problems:
+                        problems[line_str] = set()
+                    problems[line_str].add(pc)
 
         if showTime:
             print(f'analysis: {time.time()-startTime:.6}')
@@ -2278,6 +2315,190 @@ class ReadElf(object):
                     print(f"{instr.ip:<4X}: {disas:<30} {pc_lineMap[instr.ip]}")
             print("")
             exit(1)
+    
+    def checkIfMultiCmp(self, index:int, insts:list, code_to_str:dict, opkind_to_str:dict, pc_lineMap:dict):
+        if not ( (code_to_str[insts[index].code].startswith("MOV") and "MEMORY" in opkind_to_str[insts[index].op1_kind]) or \
+            (code_to_str[insts[index].code].startswith("CMP") and \
+            ("MEMORY" in opkind_to_str[insts[index].op0_kind] or "MEMORY" in opkind_to_str[insts[index].op1_kind])) ) :
+            return False
+
+        output = 0
+        nextLoadInd = -1    # index of next cmp/mov inst which accesses the same memory
+        segRange = 10    # max distance accepted between two cmp/mov
+        for i in range(index+1, min(index+segRange, len(insts)) ):
+            if not ( (code_to_str[insts[i].code].startswith("MOV") and "MEMORY" in opkind_to_str[insts[i].op1_kind]) or \
+                (code_to_str[insts[i].code].startswith("CMP") and \
+                ("MEMORY" in opkind_to_str[insts[i].op0_kind] or "MEMORY" in opkind_to_str[insts[i].op1_kind])) ):
+                continue
+
+            if self.sameMem(insts[index], insts[i]):
+                nextLoadInd = i
+                break
+        
+        if nextLoadInd == -1:
+            return False
+        
+        firstFeat, secondFeat = -1, -1
+        for i in range(index, min(index+segRange, len(insts)) ):
+            if code_to_str[insts[i].code].startswith("SBB") or\
+                code_to_str[insts[i].code].startswith("CMOV") or\
+                code_to_str[insts[i].code].startswith("SET") or\
+                code_to_str[insts[i].code].startswith("SAR"):
+                firstFeat = i
+                break
+
+        for i in range(nextLoadInd, min(nextLoadInd+segRange, len(insts)) ):
+            if i == firstFeat:
+                continue
+            if code_to_str[insts[i].code].startswith("SBB") or\
+                code_to_str[insts[i].code].startswith("CMOV") or\
+                code_to_str[insts[i].code].startswith("SET") or\
+                code_to_str[insts[i].code].startswith("SAR"):
+                secondFeat = i
+                break
+        
+        if firstFeat == -1 or secondFeat == -1:
+            return False
+
+        if insts[index].ip in pc_lineMap and insts[nextLoadInd].ip in pc_lineMap and\
+            abs(pc_lineMap[insts[index].ip] - pc_lineMap[insts[nextLoadInd].ip]) > 0:
+            return False
+
+        if output:
+            print(f"nextLoad is {insts[nextLoadInd]}")
+        return True
+
+    def getMemInfo(self, ins:Instruction, factory: InstructionInfoFactory):
+        mem = factory.info(ins).used_memory()
+        if len(mem) == 0:
+            return None
+        return self.MemInfo(ins.memory_base, ins.memory_index, ins.memory_displacement,\
+            mem[0].access)
+
+    def checkIfRefresh(self, index:int, insts:list, codeDict:dict, opKindDict:dict) -> bool:
+        interval = 8
+        
+        # mov - cmov - mov
+        if codeDict[insts[index].code].startswith("MOV") and opKindDict[insts[index].op0_kind] == "REGISTER":
+            
+            # try find cmov
+            reg = insts[index].op0_register
+
+            cmov_list = [] # index: ints
+
+            hit = [] # (hit_cmov, hit_mov)
+
+            for i in range(index+1, min(len(insts), index+interval)):
+                if not codeDict[insts[i].code].startswith("CMOV"):
+                    continue
+
+                if not "MEMORY" in opKindDict[insts[i].op1_kind]:
+                    continue
+                if not "REGISTER" in opKindDict[insts[i].op0_kind]:
+                    continue
+
+                cmov_reg = insts[i].op0_register
+                if cmov_reg != reg:
+                    continue
+                
+                cmov_list.append(i)
+            
+            if len(cmov_list) == 0:
+                return False
+            
+            for i in cmov_list:
+                for j in range(i+1, min(len(insts), index+interval)):
+                    if not codeDict[insts[j].code].startswith("MOV"):
+                        continue
+                    
+                    if not "REGISTER" in opKindDict[insts[j].op1_kind]:
+                        continue
+                    badmov_reg = insts[j].op1_register
+                    if badmov_reg != reg:
+                        continue
+                    
+                    if not "MEMORY" in opKindDict[insts[j].op0_kind]:
+                        continue
+
+                    if not self.sameMem(insts[i], insts[j]):
+                        continue
+                    
+                    hit.append((index, i, j))
+            
+            if len(hit)!=0:
+                return True
+            return False
+
+
+        # jmp - mov - mov
+        elif codeDict[insts[index].code].startswith("J"):
+            
+            hit = None
+
+            jmp_kind = opKindDict[insts[index].op0_kind].lower()
+            jmp_val = getattr(insts[index], jmp_kind)
+
+            # find first mov (addr), reg
+            interval = 8
+
+            load_mov_list = []
+
+            for i in range(index+1, min(len(insts), index+interval)):
+                if not codeDict[insts[i].code].startswith("MOV"):
+                    continue
+
+                if not "MEMORY" in opKindDict[insts[i].op1_kind]:
+                    continue
+                if not "REGISTER" in opKindDict[insts[i].op0_kind]:
+                    continue
+                
+                load_mov_list.append(i)
+            
+            for i in load_mov_list:
+                for j in range(i+1, min(len(insts), index+interval)):
+                    if not codeDict[insts[j].code].startswith("MOV"):
+                        continue
+                    
+                    if not "REGISTER" in opKindDict[insts[j].op1_kind]:
+                        continue
+                    if insts[j].op1_register != insts[i].op0_register:
+                        continue
+                    
+                    if not "MEMORY" in opKindDict[insts[j].op0_kind]:
+                        continue
+                    if not self.sameMem(insts[i], insts[j]):
+                        continue
+
+                    if jmp_val < insts[j].ip:
+                        continue
+
+                    hit = (index, i, j)
+            
+            if hit is not None:
+                return True
+            return False
+
+        
+        # kind = opKindDict[insts[index].op0_kind].lower()
+        # jmp_val = getattr(insts[index], kind)
+
+        # if index+2 >= len(insts) or insts[index+2].ip != jmp_val:
+        #     return False
+        
+        # if not ("MOV" in codeDict[insts[index+1].code] and "MEMORY" in opKindDict[insts[index+1].op1_kind]):
+        #     return False
+        # load_reg = insts[index+1].memory_base
+
+        # if not ("MOV" in codeDict[insts[index+2].code] and "MEMORY" in opKindDict[insts[index+2].op0_kind]):
+        #     return False
+        # if not insts[index+1].memory_base == load_reg:
+        #     return False
+        
+        return False
+
+
+
+
         
 
 
